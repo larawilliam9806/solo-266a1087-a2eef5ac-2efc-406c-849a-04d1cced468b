@@ -1,0 +1,22 @@
+{
+  "templates": [
+    {
+      "name": "甲厂",
+      "marker": "1",
+      "prefix": "10",
+      "scale": {"start": 2, "length": 2},
+      "weight": {"start": 4, "length": 4},
+      "_example_code": "110070123",
+      "_example_decode": {"scale_no": "07", "net_weight_g": 123}
+    },
+    {
+      "name": "乙厂",
+      "marker": "2",
+      "prefix": "20",
+      "scale": {"start": 2, "length": 3},
+      "weight": {"start": 5, "length": 3},
+      "_example_code": "220012345",
+      "_example_decode": {"scale_no": "012", "net_weight_g": 345}
+    }
+  ]
+}

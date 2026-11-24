@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime SQLite data (keep the directory, ignore database files)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Local env / OS
+.env
+.DS_Store
