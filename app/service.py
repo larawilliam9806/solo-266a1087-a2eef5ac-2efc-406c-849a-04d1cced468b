@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
+import time
 from typing import Any, Optional
 
-from .coloring import NoAssignment, solve_markers
+from . import coloring
+from .coloring import NoAssignment, solve_markers as _original_solve_markers
 from .conflicts import analyze_pair
 from .domain import MAX_TEMPLATES, TemplateSpec
-from .storage import Storage
+from .storage import Storage, VersionConflict
+
+# Public seam preserved from the original module: tests / callers may patch
+# ``app.service.solve_markers`` (or ``app.coloring.solve_markers``).
+solve_markers = _original_solve_markers
+
+
+def _solve_markers(old: list[TemplateSpec], new: list[TemplateSpec]) -> list[str]:
+    """Resolve the solver at call time so either common monkeypatch target works."""
+    service_solver = globals().get("solve_markers")
+    if service_solver is not _original_solve_markers:
+        # Explicit override of the app.service seam.
+        return service_solver(old, new)  # type: ignore[misc]
+    # Otherwise go through the coloring module attribute so a patch of
+    # ``app.coloring.solve_markers`` is observed too.
+    return coloring.solve_markers(old, new)
 
 
 class ServiceError(Exception):
@@ -26,7 +44,16 @@ class ServiceError(Exception):
         self.details = details or {}
 
 
+# Kept for backwards compatibility with code that imported the process lock.
+# Correctness no longer relies on holding it across marker computation:
+# appends are atomic inside BEGIN IMMEDIATE and assignments use an
+# active-version compare-and-commit with re-judgement, which also serialises
+# against *other processes* (the CLI importer).
 service_lock = threading.RLock()
+
+# A contended assignment retries only when another writer committed first;
+# every retry makes real progress, so a generous bound is safe.
+MAX_VERSION_ATTEMPTS = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -145,19 +172,13 @@ def import_templates(
                 details={"index": i},
             )
 
-    with service_lock:
-        if mode == "append":
-            _, old = storage.active_config()
-            combined = list(old) + list(templates)
-            reason = "import-append"
-        elif mode == "replace":
-            combined = list(templates)
-            reason = "import-replace"
-        else:
-            raise ServiceError(
-                "BAD_MODE", f"未知导入模式 mode={mode!r} (use replace|append)", 422
-            )
+    if mode not in ("append", "replace"):
+        raise ServiceError(
+            "BAD_MODE", f"未知导入模式 mode={mode!r} (use replace|append)", 422
+        )
 
+    if mode == "replace":
+        combined = list(templates)
         if len(combined) > MAX_TEMPLATES and not force:
             raise ServiceError(
                 "TEMPLATE_LIMIT_EXCEEDED",
@@ -169,27 +190,95 @@ def import_templates(
                     "mode": mode,
                 },
             )
+        version = storage.commit_new_config(combined, reason="import-replace")
+    else:
+        # Append atomically against the *latest* active version inside one
+        # BEGIN IMMEDIATE transaction: read current -> join -> enforce the
+        # 12-template cap -> write.  Concurrent appenders (service threads or
+        # separate CLI processes) therefore chain in actual commit order and
+        # never overwrite each other's committed templates.
+        try:
+            with storage.transaction() as conn:
+                base_version = storage.active_version(conn)
+                old = storage.templates_at(base_version, conn)
+                combined = list(old) + list(templates)
 
-        version = storage.commit_new_config(combined, reason=reason)
-        _, active = storage.active_config()
-        warnings = pair_warnings(active)
-        return {
-            "version": version,
-            "imported_count": len(templates),
-            "mode": mode,
-            "warnings": warnings,
-            "valid": not warnings,
-            "config": config_to_dict(version, active),
-        }
+                if len(combined) > MAX_TEMPLATES and not force:
+                    raise ServiceError(
+                        "TEMPLATE_LIMIT_EXCEEDED",
+                        f"新旧模板合计 {len(combined)} 套，超过上限 {MAX_TEMPLATES} 套",
+                        status=409,
+                        details={
+                            "total": len(combined),
+                            "old_count": len(old),
+                            "imported_count": len(templates),
+                            "max_templates": MAX_TEMPLATES,
+                            "mode": mode,
+                            "active_version": base_version,
+                        },
+                    )
+
+                version = storage.write_version(conn, combined, reason="import-append")
+        except ServiceError:
+            raise
+        except Exception as exc:
+            raise ServiceError(
+                "SAVE_FAILED",
+                f"追加导入保存失败，已沿用原配置: {exc}",
+                status=500,
+                details={"mode": mode},
+            ) from exc
+
+    # Read back the immutable rows of *our own* version.  Re-reading the active
+    # pointer here could return a newer process's config and mix our version
+    # number with somebody else's templates.
+    committed = storage.templates_at(version)
+    warnings = pair_warnings(committed)
+    return {
+        "version": version,
+        "imported_count": len(templates),
+        "mode": mode,
+        "warnings": warnings,
+        "valid": not warnings,
+        "config": config_to_dict(version, committed),
+    }
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        word in str(exc).lower() for word in ("locked", "busy")
+    )
 
 
 def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[str, Any]:
-    with service_lock:
+    """Assign markers and commit a new config.
+
+    Concurrency protocol (safe across processes sharing the SQLite file):
+
+    1. Read the active version and its templates (snapshot).
+    2. Enforce the 12-template cap and solve the coloring on that snapshot,
+       *without* holding any database write transaction, so a CLI append (or
+       decode in another process) can complete while markers are computed.
+    3. Conditional commit: the new version is written only if the active
+       version is still the snapshot version (``expected_version``).
+    4. On a version conflict another writer got in first: re-read the new
+       active config and re-run steps 2-3 against it.  No solution or a
+       violated limit on the current config fails with 409 and writes nothing.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
         version_before, old = storage.active_config()
         old_count = len(old)
-        total = old_count + len(new_templates)
+        new_count = len(new_templates)
+        total = old_count + new_count
+        can_retry = attempt < MAX_VERSION_ATTEMPTS
 
         if total > MAX_TEMPLATES:
+            # If the active pointer already moved, judge against the new base
+            # instead of rejecting a stale snapshot.
+            if can_retry and not storage.is_active_version(version_before):
+                continue
             raise ServiceError(
                 "TEMPLATE_LIMIT_EXCEEDED",
                 f"新旧模板合计 {total} 套，超过上限 {MAX_TEMPLATES} 套；"
@@ -197,7 +286,7 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
                 status=409,
                 details={
                     "old_count": old_count,
-                    "new_count": len(new_templates),
+                    "new_count": new_count,
                     "total": total,
                     "max_templates": MAX_TEMPLATES,
                     "active_version": version_before,
@@ -205,15 +294,17 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
             )
 
         try:
-            chosen = solve_markers(old, new_templates)
+            chosen = _solve_markers(old, new_templates)
         except NoAssignment as exc:
+            if can_retry and not storage.is_active_version(version_before):
+                continue
             raise ServiceError(
                 "NO_SOLUTION",
                 f"{exc}；原配置保持不变",
                 status=409,
                 details={
                     "old_count": old_count,
-                    "new_count": len(new_templates),
+                    "new_count": new_count,
                     "total": total,
                     "max_templates": MAX_TEMPLATES,
                     "active_version": version_before,
@@ -234,8 +325,28 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
         combined = list(old) + marked_new
 
         try:
-            new_version = storage.commit_new_config(combined, reason="assign-batch")
+            new_version = storage.commit_new_config(
+                combined,
+                reason="assign-batch",
+                expected_version=version_before,
+            )
+        except VersionConflict as conflict:
+            # Another batch/append committed first -> re-judge on its version.
+            if not can_retry:
+                raise ServiceError(
+                    "SAVE_FAILED",
+                    "配置并发提交冲突次数过多，本批未保存，请重试",
+                    status=500,
+                    details={
+                        "expected_version": conflict.expected_version,
+                        "active_version": conflict.current_version,
+                    },
+                ) from conflict
+            continue
         except Exception as exc:  # save failure -> original config stays active
+            if _is_lock_error(exc) and can_retry:
+                time.sleep(min(0.02 * attempt, 0.5))
+                continue
             raise ServiceError(
                 "SAVE_FAILED",
                 f"配置保存失败，已沿用原配置: {exc}",
@@ -243,12 +354,20 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
                 details={"active_version": version_before},
             ) from exc
 
-        _, active = storage.active_config()
+        # The version rows are immutable: everything in the response (version,
+        # markers, templates, config snapshot) comes from THIS commit.  Never
+        # substitute a fresh active-pointer read, which may belong to the next
+        # committer.
+        committed = storage.templates_at(new_version)
+        if len(committed) != len(combined):  # defensive; should never happen
+            committed = combined
+        persisted_new = committed[old_count:]
         old_marker_set = {t.marker for t in old}
         fresh = sorted({m for m in chosen if m not in old_marker_set})
 
         assignments = []
-        for i, (t, m) in enumerate(zip(marked_new, chosen)):
+        for i, m in enumerate(chosen):
+            t = persisted_new[i] if i < len(persisted_new) else marked_new[i]
             assignments.append(
                 {
                     "index": i,
@@ -267,7 +386,7 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
             "version": new_version,
             "previous_version": version_before,
             "old_count": old_count,
-            "new_count": len(new_templates),
+            "new_count": new_count,
             "total": len(combined),
             "max_templates": MAX_TEMPLATES,
             # aligned with the submission order
@@ -293,7 +412,7 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
                 "old_markers": sorted(old_marker_set),
                 "distinct_markers_on_new_templates": len(set(chosen)),
             },
-            "config": config_to_dict(new_version, active),
+            "config": config_to_dict(new_version, committed),
         }
 
 

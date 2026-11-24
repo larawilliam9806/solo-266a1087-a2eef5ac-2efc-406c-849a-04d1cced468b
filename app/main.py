@@ -7,6 +7,7 @@ import os
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -229,16 +230,23 @@ def docs_json_redirect() -> RedirectResponse:
 @app.get("/api/config/current")
 @app.get("/api/active-config")
 @app.get("/config")
-def get_config() -> dict:
-    version, templates = storage.active_config()
-    return config_to_dict(version, templates)
+def get_config(version: Optional[int] = None) -> dict:
+    if version is not None:
+        # Immutable snapshot of a specific committed version (used to verify
+        # that an assign response matches exactly its own submission).
+        return config_to_dict(version, storage.templates_at(version))
+    active_version, templates = storage.active_config()
+    return config_to_dict(active_version, templates)
 
 
 @app.get("/api/templates")
 @app.get("/templates")
-def list_templates() -> dict:
-    version, templates = storage.active_config()
-    return {"success": True, **config_to_dict(version, templates)}
+def list_templates(version: Optional[int] = None) -> dict:
+    if version is not None:
+        templates = storage.templates_at(version)
+        return {"success": True, **config_to_dict(version, templates)}
+    active_version, templates = storage.active_config()
+    return {"success": True, **config_to_dict(active_version, templates)}
 
 
 @app.get("/api/markers")
@@ -299,21 +307,26 @@ async def import_handler(
     mode: Optional[str] = None,
     force: Optional[bool] = None,
 ) -> JSONResponse:
+    # Blocking SQLite/colouring work runs in the worker threadpool so a long
+    # marker computation never stalls the event loop (concurrent decode,
+    # health and import requests stay responsive).
     use_mode = mode or payload.mode or "replace"
     use_force = bool(force) or payload.force
     specs = _to_specs(payload)
-    result = import_templates(storage, specs, mode=use_mode, force=use_force)
+    result = await run_in_threadpool(
+        import_templates, storage, specs, mode=use_mode, force=use_force
+    )
     return JSONResponse(status_code=200, content={"success": True, **result})
 
 
 async def assign_handler(payload: BatchRequest) -> JSONResponse:
     specs = _to_specs(payload)
-    result = assign_batch(storage, specs)
+    result = await run_in_threadpool(assign_batch, storage, specs)
     return JSONResponse(status_code=200, content=result)
 
 
 async def reset_handler() -> JSONResponse:
-    version = storage.reset_empty()
+    version = await run_in_threadpool(storage.reset_empty)
     return JSONResponse(
         status_code=200,
         content={
@@ -325,7 +338,8 @@ async def reset_handler() -> JSONResponse:
 
 
 async def decode_handler(payload: DecodeRequest) -> JSONResponse:
-    return JSONResponse(status_code=200, content=decode_code(storage, payload.code))
+    result = await run_in_threadpool(decode_code, storage, payload.code)
+    return JSONResponse(status_code=200, content=result)
 
 
 def decode_path_handler(code: str) -> JSONResponse:
@@ -603,7 +617,8 @@ async def _catch_all_post(request: Request, rest: str = "") -> JSONResponse:
             raise ServiceError("MISSING_CODE", "请求中找不到 code 磅单码", 422)
         if isinstance(code, int):
             code = str(code).zfill(9)
-        return JSONResponse(status_code=200, content=decode_code(storage, code))
+        result = await run_in_threadpool(decode_code, storage, code)
+        return JSONResponse(status_code=200, content=result)
 
     # assign / import both parse a BatchRequest
     try:
@@ -616,10 +631,16 @@ async def _catch_all_post(request: Request, rest: str = "") -> JSONResponse:
         mode = request.query_params.get("mode") or req.mode or "replace"
         force = request.query_params.get("force")
         use_force = (force and force.lower() in ("1", "true", "yes")) or req.force
-        result = import_templates(storage, specs, mode=mode, force=use_force)
+        result = await run_in_threadpool(
+            import_templates,
+            storage,
+            specs,
+            mode=mode,
+            force=use_force,
+        )
         return JSONResponse(status_code=200, content={"success": True, **result})
 
-    result = assign_batch(storage, specs)
+    result = await run_in_threadpool(assign_batch, storage, specs)
     return JSONResponse(status_code=200, content=result)
 
 
